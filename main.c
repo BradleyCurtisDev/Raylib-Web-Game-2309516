@@ -157,6 +157,15 @@ static float cameraX = 0.0f;
 static float cameraY = 0.0f;
 static float stateTimer = 0.0f;
 
+// sounds and music load after the first key press because browsers block audio before that
+static bool  audioReady = false;
+static Sound sndAir;
+static Sound sndPerfect;
+static Sound sndDamage;
+static Sound sndWin;
+static Sound sndLose;
+static Music musicTrack;
+
 // player and effects
 static Player    player;
 static bool      runWon = false;
@@ -427,6 +436,41 @@ static void EmitParticle(Vector2 pos, Vector2 vel, float life, float size, Color
     }
 }
 
+// loads every sound and starts the music loop
+// in the web build these files come from the preloaded sounds folder inside index.data
+static void LoadGameAudio(void)
+{
+    if (audioReady) return;
+    InitAudioDevice();
+
+    sndAir = LoadSound("sounds/Air.wav");
+    sndPerfect = LoadSound("sounds/Perfect.wav");
+    sndDamage = LoadSound("sounds/DamageTaken.wav");
+    sndWin = LoadSound("sounds/Game Win.wav");
+    sndLose = LoadSound("sounds/Game Lose.wav");
+    musicTrack = LoadMusicStream("sounds/BackgroundTrack.wav");
+
+    SetSoundVolume(sndAir, 0.6f);
+    musicTrack.looping = true;
+    SetMusicVolume(musicTrack, 0.35f);
+    PlayMusicStream(musicTrack);
+    audioReady = true;
+}
+
+// plays a sound only if the audio has been started
+static void PlayFx(Sound snd)
+{
+    if (audioReady) PlaySound(snd);
+}
+
+// the air sound gets a slightly different pitch each time so it is less repetitive
+static void PlayAirSound(void)
+{
+    if (!audioReady) return;
+    SetSoundPitch(sndAir, 0.92f + (float)GetRandomValue(0, 20)/100.0f);
+    PlaySound(sndAir);
+}
+
 // adds floating text in the first free slot
 static void SpawnText(Vector2 pos, const char *text, Color color)
 {
@@ -559,6 +603,7 @@ static void StartRun(void)
     runWon = false;
     cameraX = 0.0f;
     cameraY = player.y - CAMERA_Y;
+    if (audioReady) ResumeMusicStream(musicTrack);
     ChangeState(STATE_PLAYING);
 }
 
@@ -585,12 +630,14 @@ static void LandPlayer(float groundY, float slope)
             player.flash = 0.4f;
             tangent *= 0.7f;
             SpawnText(where, "OUCH!", (Color){ 240, 70, 70, 255 });
+            PlayFx(sndDamage);
         }
         else if (impact < PERFECT_IMPACT)
         {
             player.score += 25;
             tangent *= 1.08f;
             SpawnText(where, "PERFECT!", YELLOW);
+            PlayFx(sndPerfect);
         }
         else if (impact < GOOD_IMPACT)
         {
@@ -656,6 +703,7 @@ static void UpdatePlayer(float dt)
             player.airTime = 0.0f;
             player.vy = slope*player.vx - RELEASE_POP*(0.7f + 0.6f*speedPct);
             SpawnText((Vector2){ player.x, player.y - 40.0f }, "POP!", (Color){ 255, 220, 120, 255 });
+            PlayAirSound();
             for (int i = 0; i < 6; i++)
                 EmitParticle((Vector2){ player.x, player.y },
                              (Vector2){ -player.vx*0.2f + (RandFloat() - 0.5f)*80.0f, -RandFloat()*140.0f },
@@ -669,6 +717,7 @@ static void UpdatePlayer(float dt)
             player.vy = player.prevSlope*player.vx;
             if (!player.holding) player.vy -= CREST_POP*(player.vx/CRUISE_SPEED);
             SpawnText((Vector2){ player.x, player.y - 40.0f }, "AIR!", (Color){ 180, 220, 255, 255 });
+            PlayAirSound();
         }
         else
         {
@@ -738,6 +787,9 @@ static void UpdateDrawFrame(void)
     if (dt > 0.05f) dt = 0.05f;
     stateTimer += dt;
 
+    // the music stream needs a refill every frame
+    if (audioReady) UpdateMusicStream(musicTrack);
+
     // camera height follows the player smoothly
     float followY = (state == STATE_PLAYING) ? player.y : TerrainHeightAt(cameraX);
     float camBlend = 5.0f*dt;
@@ -753,7 +805,10 @@ static void UpdateDrawFrame(void)
             cameraX += 60.0f*dt;
             if (cameraX > levelLength*0.5f) cameraX = 0.0f;
             if (IsKeyPressed(KEY_SPACE) || IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            {
+                LoadGameAudio();
                 ChangeState(STATE_LOADING);
+            }
             break;
 
         case STATE_LOADING:
@@ -777,12 +832,16 @@ static void UpdateDrawFrame(void)
             if (player.margin <= 0.0f)
             {
                 runWon = false;
+                PlayFx(sndLose);
+                if (audioReady) PauseMusicStream(musicTrack);
                 ChangeState(STATE_GAMEOVER);
             }
             else if (player.x >= levelLength)
             {
                 cameraX = levelLength;
                 runWon = true;
+                PlayFx(sndWin);
+                if (audioReady) PauseMusicStream(musicTrack);
                 ChangeState(STATE_GAMEOVER);
             }
             break;
@@ -905,6 +964,16 @@ int main(void)
     while (!WindowShouldClose()) UpdateDrawFrame();
 #endif
 
+    if (audioReady)
+    {
+        UnloadSound(sndAir);
+        UnloadSound(sndPerfect);
+        UnloadSound(sndDamage);
+        UnloadSound(sndWin);
+        UnloadSound(sndLose);
+        UnloadMusicStream(musicTrack);
+        CloseAudioDevice();
+    }
     CloseWindow();
     return 0;
 }
