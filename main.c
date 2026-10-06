@@ -4,25 +4,30 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(PLATFORM_WEB)
     #include <emscripten/emscripten.h>
 #endif
 
+// screen size
 #define SCREEN_W        960
 #define SCREEN_H        540
 
+// how many candles and terrain points are stored
 #define MAX_POINTS      400
 #define SUBDIV          4
 #define MAX_SAMPLES     ((MAX_POINTS - 1)*SUBDIV + 1)
 #define SAMPLE_DX       12.0f
 
+// how tall the hills are and where the camera sits
 #define START_Y         300.0f
-#define PX_PER_SIGMA    34.0f
-#define MAX_STEP        16.0f
+#define PX_PER_SIGMA    40.0f
+#define MAX_STEP        20.0f
 #define CAMERA_Y        340.0f
 #define PLAYER_SCREEN_X 220.0f
 
+// player movement numbers to tune the feel
 #define GRAVITY         950.0f
 #define AIR_DIVE_MULT   2.0f
 #define SLOPE_ACCEL     340.0f
@@ -32,21 +37,32 @@
 #define CRUISE_PULL     0.8f
 #define MIN_SPEED       170.0f
 #define MAX_SPEED       620.0f
-#define LAUNCH_ACCEL    450.0f
+#define LAUNCH_ACCEL    600.0f
+#define CREST_POP       240.0f
 #define LAUNCH_COOLDOWN 0.2f
 #define RELEASE_POP     340.0f
 #define RELEASE_MIN_HOLD 0.12f
 #define RELEASE_MIN_SLOPE 0.12f
+// landing score and damage numbers
 #define MIN_AIR_TIME    0.3f
 #define PERFECT_IMPACT  160.0f
 #define GOOD_IMPACT     340.0f
-#define SAFE_IMPACT     500.0f
-#define DAMAGE_PER_PX   0.1f
+#define UPHILL_SAFE_SLOPE 0.3f
+#define UPHILL_DAMAGE   60.0f
 #define MAX_MARGIN      100.0f
 
+// seconds to wait before using the offline level
+#define FETCH_GIVE_UP   12.0f
+
+// coins that get fetched plus one offline level
+#define MAX_COINS       6
+#define MAX_LEVELS      (MAX_COINS + 1)
+
+// limits for particles and floating text
 #define MAX_PARTICLES   96
 #define MAX_TEXTS       8
 
+// the four screens of the game
 typedef enum GameState {
     STATE_TITLE,
     STATE_LOADING,
@@ -54,6 +70,15 @@ typedef enum GameState {
     STATE_GAMEOVER
 } GameState;
 
+// where the web request is up to
+typedef enum FetchStatus {
+    FETCH_IDLE,
+    FETCH_PENDING,
+    FETCH_OK,
+    FETCH_FAILED
+} FetchStatus;
+
+// everything about the player
 typedef struct Player {
     float x;
     float y;
@@ -72,6 +97,7 @@ typedef struct Player {
     bool  holding;
 } Player;
 
+// one small dot for the trail and sparks
 typedef struct Particle {
     Vector2 pos;
     Vector2 vel;
@@ -81,6 +107,7 @@ typedef struct Particle {
     Color   color;
 } Particle;
 
+// text that floats up and fades
 typedef struct FloatText {
     Vector2 pos;
     float   life;
@@ -90,24 +117,53 @@ typedef struct FloatText {
 
 static GameState state = STATE_TITLE;
 
-static float prices[MAX_POINTS];
-static float volumes[MAX_POINTS];
-static int   pointCount = 0;
+// one coin worth of candles
+typedef struct Level {
+    float  prices[MAX_POINTS];
+    float  volumes[MAX_POINTS];
+    double times[MAX_POINTS];
+    int    count;
+    int    source;
+    char   name[24];
+} Level;
 
+static const char *coinNames[MAX_COINS] = { "BTC", "ETH", "SOL", "DOGE", "XRP", "ADA" };
+// every level slot with the offline one last
+static Level levels[MAX_LEVELS];
+static int   lastLevel = -1;
+static int   fetchCoin = -1;
+
+// the level being played right now
+static float  prices[MAX_POINTS];
+static float  volumes[MAX_POINTS];
+static double priceTimes[MAX_POINTS];
+static int    pointCount = 0;
+
+// web request state
+static FetchStatus fetchStatus = FETCH_IDLE;
+static bool        dataLoaded = false;
+static bool        offlineMode = false;
+static char        sourceLabel[48] = "";
+static char        levelTitle[32] = "";
+
+// the terrain heights
 static float terrainY[MAX_SAMPLES];
 static int   sampleCount = 0;
 static float levelLength = 0.0f;
 static bool  bullMarket = true;
 
+// camera position and timers
 static float cameraX = 0.0f;
 static float cameraY = 0.0f;
 static float stateTimer = 0.0f;
 
+// player and effects
 static Player    player;
 static bool      runWon = false;
 static Particle  particles[MAX_PARTICLES];
 static FloatText texts[MAX_TEXTS];
 
+// simple random numbers that give the same result each time
 static unsigned int rngState = 12345;
 static float RandFloat(void)
 {
@@ -116,35 +172,178 @@ static float RandFloat(void)
 }
 
 // temporary map data for if i cant get the real money trends later on or if the api fails
-static void LoadFallbackData(void)
+static void GenerateOfflineLevels(void)
 {
+    Level *lv = &levels[MAX_COINS];
     rngState = 12345;
-    pointCount = 160;
     float p = 60000.0f;
     float drift = 0.0f;
-    for (int i = 0; i < pointCount; i++)
+    lv->count = 160;
+    for (int i = 0; i < lv->count; i++)
     {
         if (i%20 == 0) drift = (RandFloat() - 0.5f)*0.03f;
         p *= 1.0f + drift + (RandFloat() - 0.5f)*0.02f;
-        prices[i]  = p;
-        volumes[i] = 50.0f + RandFloat()*150.0f;
+        lv->prices[i]  = p;
+        lv->volumes[i] = 50.0f + RandFloat()*150.0f;
+        lv->times[i]   = 1760000000000.0 + (double)i*900000.0;
+    }
+    lv->source = 2;
+    strcpy(lv->name, "Offline Sample");
+}
+
+#if defined(PLATFORM_WEB)
+EMSCRIPTEN_KEEPALIVE void BeginCoin(int coin)
+{
+    fetchCoin = -1;
+    if (fetchStatus != FETCH_PENDING || coin < 0 || coin >= MAX_COINS) return;
+    fetchCoin = coin;
+    levels[coin].count = 0;
+    levels[coin].source = 0;
+    strcpy(levels[coin].name, coinNames[coin]);
+}
+
+// saves one candle
+EMSCRIPTEN_KEEPALIVE void AddCoinPoint(double close, double volume, double timeMs)
+{
+    if (fetchStatus != FETCH_PENDING || fetchCoin < 0) return;
+    Level *lv = &levels[fetchCoin];
+    if (lv->count >= MAX_POINTS) return;
+    lv->prices[lv->count] = (float)close;
+    lv->volumes[lv->count] = (float)volume;
+    lv->times[lv->count] = timeMs;
+    lv->count++;
+}
+
+// a coin only counts if it got at least 30 candles
+EMSCRIPTEN_KEEPALIVE void EndCoin(void)
+{
+    if (fetchStatus == FETCH_PENDING && fetchCoin >= 0)
+        levels[fetchCoin].source = (levels[fetchCoin].count >= 30) ? 1 : 0;
+    fetchCoin = -1;
+}
+
+// tells the game if any coin loaded
+EMSCRIPTEN_KEEPALIVE void FetchDone(void)
+{
+    if (fetchStatus != FETCH_PENDING) return;
+    int ready = 0;
+    for (int i = 0; i < MAX_COINS; i++)
+        if (levels[i].source == 1) ready++;
+    fetchStatus = (ready > 0) ? FETCH_OK : FETCH_FAILED;
+}
+
+// runs in the browser and asks binance for every coin at the same time with no key needed
+// each request has a timeout and the reply is checked before its trusted
+EM_JS(void, JsFetchMarket, (void), {
+    const TIMEOUT_MS = 5000;
+    const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT", "ADAUSDT"];
+
+    async function getJson(url) {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+        try {
+            const res = await fetch(url, { signal: ctl.signal });
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            return await res.json();
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    async function fetchCoin(symbol) {
+        try {
+            const data = await getJson("https://api.binance.com/api/v3/klines?symbol=" + symbol + "&interval=15m&limit=200");
+            if (!Array.isArray(data) || data.length < 30) throw new Error("bad data");
+            const rows = data.map(r => ({ c: parseFloat(r[4]), v: parseFloat(r[5]), t: r[0] }));
+            if (!rows.every(r => isFinite(r.c) && isFinite(r.v) && r.c > 0)) throw new Error("bad numbers");
+            return rows;
+        } catch (e) {
+            console.warn(symbol + " failed:", e);
+            return null;
+        }
+    }
+
+    (async () => {
+        const results = await Promise.all(SYMBOLS.map(s => fetchCoin(s)));
+        results.forEach((rows, i) => {
+            if (rows === null) return;
+            Module._BeginCoin(i);
+            for (const r of rows) Module._AddCoinPoint(r.c, r.v, r.t);
+            Module._EndCoin();
+        });
+        Module._FetchDone();
+    })();
+});
+#endif
+
+// starts the web request
+static void StartFetch(void)
+{
+    fetchStatus = FETCH_PENDING;
+#if defined(PLATFORM_WEB)
+    JsFetchMarket();
+#else
+    fetchStatus = FETCH_FAILED;
+#endif
+}
+
+// picks a random coin that is not the last one played or the offline level if nothing loaded
+static void PickLevel(void)
+{
+    int candidates[MAX_LEVELS];
+    int n = 0;
+
+    for (int i = 0; i < MAX_COINS; i++)
+        if (levels[i].source == 1 && i != lastLevel) candidates[n++] = i;
+    if (n == 0)
+        for (int i = 0; i < MAX_COINS; i++)
+            if (levels[i].source == 1) candidates[n++] = i;
+    if (n == 0) candidates[n++] = MAX_COINS;
+
+    int pick = candidates[GetRandomValue(0, n - 1)];
+    Level *lv = &levels[pick];
+    lastLevel = pick;
+
+    pointCount = lv->count;
+    memcpy(prices, lv->prices, sizeof(float)*lv->count);
+    memcpy(volumes, lv->volumes, sizeof(float)*lv->count);
+    memcpy(priceTimes, lv->times, sizeof(double)*lv->count);
+    offlineMode = (lv->source == 2);
+
+    if (lv->source == 1)
+    {
+        snprintf(levelTitle, sizeof(levelTitle), "%s/USDT", lv->name);
+        strcpy(sourceLabel, "15m candles - Binance");
+    }
+    else
+    {
+        snprintf(levelTitle, sizeof(levelTitle), "%s", lv->name);
+        strcpy(sourceLabel, "Offline sample data");
     }
 }
 
+
+// turns the prices into hills
 static void BuildTerrain(void)
 {
     static float tmp[MAX_SAMPLES];
     static float pointH[MAX_POINTS];
 
-    float sum2 = 0.0f;
+    // sigma is a typical price move so every coin gets hills of a similar size
+    // it uses the median move instead of the standard deviation because a few huge candles
+    // make the standard deviation too big and then everything else looks flat
+    static float absMoves[MAX_POINTS];
     for (int i = 1; i < pointCount; i++)
     {
-        float r = (prices[i] - prices[i - 1])/prices[i - 1];
-        sum2 += r*r;
+        float r = fabsf((prices[i] - prices[i - 1])/prices[i - 1]);
+        int j = i - 1;
+        while (j > 0 && absMoves[j - 1] > r) { absMoves[j] = absMoves[j - 1]; j--; }
+        absMoves[j] = r;
     }
-    float sigma = sqrtf(sum2/(float)(pointCount - 1));
+    float sigma = absMoves[(pointCount - 1)/2]/0.6745f;
     if (sigma < 0.000001f) sigma = 1.0f;
 
+    // each price change moves the hill up or down
     pointH[0] = START_Y;
     for (int i = 1; i < pointCount; i++)
     {
@@ -152,6 +351,7 @@ static void BuildTerrain(void)
         pointH[i] = pointH[i - 1] - (r/sigma)*PX_PER_SIGMA;
     }
 
+    // fill in points between the candles
     sampleCount = (pointCount - 1)*SUBDIV + 1;
     for (int i = 0; i < sampleCount; i++)
     {
@@ -162,6 +362,7 @@ static void BuildTerrain(void)
         terrainY[i] = pointH[a] + (pointH[a + 1] - pointH[a])*t;
     }
 
+    // smooth it with a small average
     for (int i = 0; i < sampleCount; i++)
     {
         float sum = 0.0f;
@@ -176,6 +377,7 @@ static void BuildTerrain(void)
     }
     memcpy(terrainY, tmp, sizeof(float)*sampleCount);
 
+    // stop any slope from getting too steep
     for (int i = 1; i < sampleCount; i++)
     {
         float d = terrainY[i] - terrainY[i - 1];
@@ -184,10 +386,12 @@ static void BuildTerrain(void)
         terrainY[i] = terrainY[i - 1] + d;
     }
 
+    // level length and sky colour
     levelLength = (float)(sampleCount - 1)*SAMPLE_DX;
     bullMarket = (prices[pointCount - 1] >= prices[0]);
 }
 
+// gets a terrain point and stays inside the level
 static float TerrainAtIndex(int i)
 {
     if (i < 0) i = 0;
@@ -195,6 +399,7 @@ static float TerrainAtIndex(int i)
     return terrainY[i];
 }
 
+// height of the ground at any x position
 static float TerrainHeightAt(float worldX)
 {
     float f = worldX/SAMPLE_DX;
@@ -203,11 +408,13 @@ static float TerrainHeightAt(float worldX)
     return TerrainAtIndex(i) + (TerrainAtIndex(i + 1) - TerrainAtIndex(i))*t;
 }
 
+// how steep the ground is at x
 static float TerrainSlopeAt(float worldX)
 {
     return (TerrainHeightAt(worldX + 24.0f) - TerrainHeightAt(worldX - 24.0f))/48.0f;
 }
 
+// adds a particle in the first free slot
 static void EmitParticle(Vector2 pos, Vector2 vel, float life, float size, Color color)
 {
     for (int i = 0; i < MAX_PARTICLES; i++)
@@ -220,6 +427,7 @@ static void EmitParticle(Vector2 pos, Vector2 vel, float life, float size, Color
     }
 }
 
+// adds floating text in the first free slot
 static void SpawnText(Vector2 pos, const char *text, Color color)
 {
     for (int i = 0; i < MAX_TEXTS; i++)
@@ -236,6 +444,7 @@ static void SpawnText(Vector2 pos, const char *text, Color color)
     }
 }
 
+// moves and ages the particles and text
 static void UpdateEffects(float dt)
 {
     for (int i = 0; i < MAX_PARTICLES; i++)
@@ -257,6 +466,7 @@ static void UpdateEffects(float dt)
     }
 }
 
+// draws particles and text with the camera offset
 static void DrawEffects(void)
 {
     for (int i = 0; i < MAX_PARTICLES; i++)
@@ -279,11 +489,13 @@ static void DrawEffects(void)
     }
 }
 
+// draws text in the middle of the screen
 static void DrawCentered(const char *text, int y, int size, Color col)
 {
     DrawText(text, (SCREEN_W - MeasureText(text, size))/2, y, size, col);
 }
 
+// sky is green for a rising market and red for a falling one
 static void DrawSky(void)
 {
     Color top = bullMarket ? (Color){ 20, 60, 50, 255 }  : (Color){ 70, 25, 35, 255 };
@@ -291,6 +503,7 @@ static void DrawSky(void)
     DrawRectangleGradientV(0, 0, SCREEN_W, SCREEN_H, top, bot);
 }
 
+// draws only the part of the ground that is on screen
 static void DrawTerrain(void)
 {
     int first = (int)floorf((cameraX - PLAYER_SCREEN_X)/SAMPLE_DX) - 1;
@@ -303,21 +516,25 @@ static void DrawTerrain(void)
         float y0 = TerrainAtIndex(i) - cameraY;
         float y1 = TerrainAtIndex(i + 1) - cameraY;
 
+        // dark ground under the line
         Color fill = (Color){ 18, 24, 38, 255 };
         DrawTriangle((Vector2){ x0, y0 }, (Vector2){ x0, SCREEN_H }, (Vector2){ x1, SCREEN_H }, fill);
         DrawTriangle((Vector2){ x0, y0 }, (Vector2){ x1, SCREEN_H }, (Vector2){ x1, y1 }, fill);
 
+        // green line going up and red going down
         Color line = (y1 <= y0) ? (Color){ 60, 230, 120, 255 } : (Color){ 240, 70, 70, 255 };
         DrawLineEx((Vector2){ x0, y0 }, (Vector2){ x1, y1 }, 4.0f, line);
     }
 }
 
+// switches screen and resets the timer
 static void ChangeState(GameState next)
 {
     state = next;
     stateTimer = 0.0f;
 }
 
+// resets the player and camera for a new run
 static void StartRun(void)
 {
     float slope = TerrainSlopeAt(0.0f);
@@ -345,8 +562,10 @@ static void StartRun(void)
     ChangeState(STATE_PLAYING);
 }
 
+// works out what happens when the player hits the ground
 static void LandPlayer(float groundY, float slope)
 {
+    // split the speed into along the ground and into the ground
     float len = sqrtf(1.0f + slope*slope);
     float tangent = (player.vx + player.vy*slope)/len;
     float impact = (player.vy - player.vx*slope)/len;
@@ -354,11 +573,15 @@ static void LandPlayer(float groundY, float slope)
 
     Vector2 where = { player.x, groundY - 30.0f };
 
+    // short hops do not count
     if (player.airTime >= MIN_AIR_TIME)
     {
-        if (impact > SAFE_IMPACT)
+        // only an uphill landing hurts and flats and small slopes are safe
+        // slope is negative when the ground goes up
+        float uphill = -slope;
+        if (uphill > UPHILL_SAFE_SLOPE)
         {
-            player.margin -= (impact - SAFE_IMPACT)*DAMAGE_PER_PX;
+            player.margin -= (uphill - UPHILL_SAFE_SLOPE)*UPHILL_DAMAGE*(player.vx/CRUISE_SPEED);
             player.flash = 0.4f;
             tangent *= 0.7f;
             SpawnText(where, "OUCH!", (Color){ 240, 70, 70, 255 });
@@ -381,6 +604,7 @@ static void LandPlayer(float groundY, float slope)
                          0.5f, 4.0f, (Color){ 220, 230, 255, 255 });
     }
 
+    // keep the speed after landing
     player.speed = fminf(fmaxf(tangent, MIN_SPEED), MAX_SPEED);
     player.y = groundY;
     player.vy = 0.0f;
@@ -389,10 +613,12 @@ static void LandPlayer(float groundY, float slope)
     player.grounded = true;
 }
 
+// all the player movement and input
 static void UpdatePlayer(float dt)
 {
     if (dt < 0.001f) dt = 0.001f;
 
+    // check if the button is being held
     bool wasHolding = player.holding;
     float heldFor = player.holdTime;
     player.holding = IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S) || IsMouseButtonDown(MOUSE_BUTTON_LEFT);
@@ -404,21 +630,25 @@ static void UpdatePlayer(float dt)
     float slope;
     float targetAngle;
 
+    // on the ground the player follows the slope
     if (player.grounded)
     {
         slope = TerrainSlopeAt(player.x);
         float len = sqrtf(1.0f + slope*slope);
         float sinT = slope/len;
 
+        // downhill speeds up and uphill slows down
         float accel = SLOPE_ACCEL*sinT*(player.holding ? HOLD_BOOST : 1.0f);
         if (sinT < 0.0f) accel *= UPHILL_FACTOR;
         player.speed += accel*dt + (CRUISE_SPEED - player.speed)*CRUISE_PULL*dt;
         player.speed = fminf(fmaxf(player.speed, MIN_SPEED), MAX_SPEED);
 
         player.vx = player.speed/len;
+        // bend is how sharply the ground curves away
         float bend = (slope - player.prevSlope)*player.vx/dt;
         if (player.cooldown > 0.0f) player.cooldown -= dt;
 
+        // letting go on a downhill pops the player up
         if (released && heldFor >= RELEASE_MIN_HOLD && slope > RELEASE_MIN_SLOPE)
         {
             float speedPct = fminf(1.0f, player.speed/MAX_SPEED);
@@ -431,11 +661,13 @@ static void UpdatePlayer(float dt)
                              (Vector2){ -player.vx*0.2f + (RandFloat() - 0.5f)*80.0f, -RandFloat()*140.0f },
                              0.4f, 3.5f, (Color){ 255, 200, 80, 255 });
         }
+        // flying off the top of a hill
         else if (bend > LAUNCH_ACCEL && player.cooldown <= 0.0f)
         {
             player.grounded = false;
             player.airTime = 0.0f;
-            player.vy = player.prevSlope*player.vx - 20.0f;
+            player.vy = player.prevSlope*player.vx;
+            if (!player.holding) player.vy -= CREST_POP*(player.vx/CRUISE_SPEED);
             SpawnText((Vector2){ player.x, player.y - 40.0f }, "AIR!", (Color){ 180, 220, 255, 255 });
         }
         else
@@ -453,8 +685,10 @@ static void UpdatePlayer(float dt)
         }
     }
 
+    // in the air gravity pulls the player down
     if (!player.grounded)
     {
+        // holding in the air dives faster
         float g = player.holding ? GRAVITY*AIR_DIVE_MULT : GRAVITY;
         player.vy += g*dt;
         player.x += player.vx*dt;
@@ -472,9 +706,11 @@ static void UpdatePlayer(float dt)
                          (Vector2){ -player.vx*0.1f, 0.0f }, 0.25f, 2.5f, (Color){ 255, 255, 255, 200 });
     }
 
+    // camera follows the player
     cameraX = player.x;
 }
 
+// draws the board and the rider
 static void DrawPlayer(void)
 {
     float a = player.angle*DEG2RAD;
@@ -487,12 +723,22 @@ static void DrawPlayer(void)
     DrawCircleV((Vector2){ rider.x + 3.0f, rider.y - 2.0f }, 2.5f, BLACK);
 }
 
+// pick a level then build it then start
+static void NewRun(void)
+{
+    PickLevel();
+    BuildTerrain();
+    StartRun();
+}
+
+// runs every frame
 static void UpdateDrawFrame(void)
 {
     float dt = GetFrameTime();
     if (dt > 0.05f) dt = 0.05f;
     stateTimer += dt;
 
+    // camera height follows the player smoothly
     float followY = (state == STATE_PLAYING) ? player.y : TerrainHeightAt(cameraX);
     float camBlend = 5.0f*dt;
     if (camBlend > 1.0f) camBlend = 1.0f;
@@ -500,6 +746,7 @@ static void UpdateDrawFrame(void)
 
     UpdateEffects(dt);
 
+    // update logic for each screen
     switch (state)
     {
         case STATE_TITLE:
@@ -510,13 +757,19 @@ static void UpdateDrawFrame(void)
             break;
 
         case STATE_LOADING:
-            // the web request should go here and if it takes too long to load the data, the game will generate the offline data map instead
-            if (stateTimer > 1.2f)
+            // data is kept after the first load so restarting never fetches again
+            // the game keeps drawing while the request runs and goes offline if it fails or takes too long
+            if (!dataLoaded)
             {
-                LoadFallbackData();
-                BuildTerrain();
-                StartRun();
+                if (fetchStatus == FETCH_IDLE) StartFetch();
+                if (fetchStatus == FETCH_OK) dataLoaded = true;
+                else if (fetchStatus == FETCH_FAILED || stateTimer > FETCH_GIVE_UP)
+                {
+                    fetchStatus = FETCH_FAILED;
+                    dataLoaded = true;
+                }
             }
+            if (dataLoaded && stateTimer > 0.8f) NewRun();
             break;
 
         case STATE_PLAYING:
@@ -535,16 +788,18 @@ static void UpdateDrawFrame(void)
             break;
 
         case STATE_GAMEOVER:
-            if (IsKeyPressed(KEY_R)) StartRun();
+            if (IsKeyPressed(KEY_R)) NewRun();
             if (IsKeyPressed(KEY_ESCAPE)) { cameraX = 0.0f; ChangeState(STATE_TITLE); }
             break;
     }
 
+    // drawing starts here
     BeginDrawing();
         ClearBackground(BLACK);
         DrawSky();
         DrawTerrain();
 
+        // text and hud for each screen
         switch (state)
         {
             case STATE_TITLE:
@@ -559,6 +814,8 @@ static void UpdateDrawFrame(void)
             {
                 int dots = (int)(stateTimer*3.0f)%4;
                 DrawCentered(TextFormat("Fetching the market%.*s", dots, "..."), 240, 32, RAYWHITE);
+                if (stateTimer > 3.0f)
+                    DrawCentered("Still trying - will switch to offline data soon", 290, 20, LIGHTGRAY);
                 break;
             }
 
@@ -569,6 +826,7 @@ static void UpdateDrawFrame(void)
                 if (player.flash > 0.0f)
                     DrawRectangle(0, 0, SCREEN_W, SCREEN_H, (Color){ 255, 0, 0, (unsigned char)(player.flash/0.4f*110.0f) });
 
+                // margin bar
                 float marginPct = player.margin/MAX_MARGIN;
                 if (marginPct < 0.0f) marginPct = 0.0f;
                 Color barCol = (marginPct > 0.5f) ? (Color){ 60, 230, 120, 255 } : (marginPct > 0.25f) ? ORANGE : (Color){ 240, 70, 70, 255 };
@@ -577,6 +835,7 @@ static void UpdateDrawFrame(void)
                 DrawRectangle(SCREEN_W - 190, 20, (int)(170.0f*marginPct), 16, barCol);
                 DrawRectangleLines(SCREEN_W - 190, 20, 170, 16, RAYWHITE);
 
+                // speed bar
                 float spd = (player.grounded ? player.speed : player.vx);
                 float spdPct = fminf(1.0f, spd/MAX_SPEED);
                 DrawText("SPEED", SCREEN_W - 260, 44, 18, RAYWHITE);
@@ -587,6 +846,7 @@ static void UpdateDrawFrame(void)
                 DrawText(TextFormat("Score: %d", player.score), SCREEN_W - 260, 72, 22, YELLOW);
                 DrawText("HOLD SPACE / CLICK / DOWN: press into the slope (downhill = speed, uphill = slow)", 20, SCREEN_H - 28, 18, RAYWHITE);
 
+                // work out the price where the player is
                 float f = player.x/(SAMPLE_DX*SUBDIV);
                 int a = (int)f;
                 if (a < 0) a = 0;
@@ -594,8 +854,20 @@ static void UpdateDrawFrame(void)
                 float t = f - (float)a;
                 if (t > 1.0f) t = 1.0f;
                 float price = prices[a] + (prices[a + 1] - prices[a])*t;
-                DrawText(TextFormat("Price: %.2f", price), 20, 20, 24, RAYWHITE);
+                if (price < 10.0f) DrawText(TextFormat("Price: %.4f", price), 20, 20, 24, RAYWHITE);
+                else DrawText(TextFormat("Price: %.2f", price), 20, 20, 24, RAYWHITE);
                 DrawText(TextFormat("Progress: %d%%", (int)(100.0f*player.x/levelLength)), 20, 50, 24, RAYWHITE);
+                DrawText(levelTitle, 20, 80, 24, YELLOW);
+                DrawText(sourceLabel, 20, 108, 18, LIGHTGRAY);
+                if (offlineMode) DrawText("OFFLINE MODE", 20, 130, 22, (Color){ 255, 140, 60, 255 });
+
+                // show the level name at the start
+                if (stateTimer < 2.5f)
+                {
+                    float fade = fminf(1.0f, (2.5f - stateTimer)*2.0f);
+                    DrawCentered(levelTitle, 110, 56, (Color){ 255, 255, 255, (unsigned char)(255.0f*fade) });
+                    DrawCentered(sourceLabel, 175, 22, (Color){ 220, 220, 220, (unsigned char)(255.0f*fade) });
+                }
                 break;
             }
 
@@ -605,7 +877,8 @@ static void UpdateDrawFrame(void)
                 else        DrawCentered("Liquidated!", 130, 56, (Color){ 240, 70, 70, 255 });
                 DrawCentered(TextFormat("Score: %d", player.score), 220, 32, RAYWHITE);
                 DrawCentered(TextFormat("Progress: %d%%", (int)(100.0f*player.x/levelLength)), 262, 24, LIGHTGRAY);
-                DrawCentered("Press R to restart   /   ESC for title", 330, 24, RAYWHITE);
+                DrawCentered(TextFormat("Level: %s", levelTitle), 296, 24, LIGHTGRAY);
+                DrawCentered("Press R for a new random level   /   ESC for title", 350, 24, RAYWHITE);
                 break;
         }
     EndDrawing();
@@ -616,12 +889,16 @@ int main(void)
     InitWindow(SCREEN_W, SCREEN_H, "Market Surfer");
     SetExitKey(KEY_NULL);
 
-    LoadFallbackData();
+    // random seed so the coin is different each time
+    SetRandomSeed((unsigned int)time(NULL));
+    // make the offline level first so the title has a map
+    GenerateOfflineLevels();
+    PickLevel();
     BuildTerrain();
 
 // help from AI understanding emscripten
 #if defined(PLATFORM_WEB)
-    // The browser owns the loop, so hand it the frame function (it must not block)
+    // the browser runs the loop so it is given the frame function and that cannot block
     emscripten_set_main_loop(UpdateDrawFrame, 0, 1);
 #else
     SetTargetFPS(60);
