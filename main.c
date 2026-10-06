@@ -10,7 +10,6 @@
     #include <emscripten/emscripten.h>
 #endif
 
-// screen size
 #define SCREEN_W        960
 #define SCREEN_H        540
 
@@ -18,37 +17,35 @@
 #define MAX_POINTS      400
 #define SUBDIV          4
 #define MAX_SAMPLES     ((MAX_POINTS - 1)*SUBDIV + 1)
-#define SAMPLE_DX       12.0f
+#define SAMPLE_DX       20.0f
 
 // how tall the hills are and where the camera sits
 #define START_Y         300.0f
-#define PX_PER_SIGMA    40.0f
-#define MAX_STEP        20.0f
+#define PX_PER_SIGMA    64.0f
+#define MAX_STEP        32.0f
 #define CAMERA_Y        340.0f
 #define PLAYER_SCREEN_X 220.0f
 
-// player movement numbers to tune the feel
-#define GRAVITY         950.0f
+#define CAMERA_ZOOM     0.8f
+#define PLAYER_SCALE    0.65f
+
+#define GRAVITY         800.0f
 #define AIR_DIVE_MULT   2.0f
-#define SLOPE_ACCEL     340.0f
+#define SLOPE_ACCEL     300.0f
 #define HOLD_BOOST      1.8f
 #define UPHILL_FACTOR   0.6f
-#define CRUISE_SPEED    330.0f
+#define CRUISE_SPEED    260.0f
 #define CRUISE_PULL     0.8f
-#define MIN_SPEED       170.0f
-#define MAX_SPEED       620.0f
-#define LAUNCH_ACCEL    600.0f
-#define CREST_POP       240.0f
+#define MIN_SPEED       140.0f
+#define MAX_SPEED       480.0f
+#define LAUNCH_ACCEL    230.0f
+#define CREST_POP       300.0f
 #define LAUNCH_COOLDOWN 0.2f
-#define RELEASE_POP     340.0f
-#define RELEASE_MIN_HOLD 0.12f
-#define RELEASE_MIN_SLOPE 0.12f
-// landing score and damage numbers
 #define MIN_AIR_TIME    0.3f
-#define PERFECT_IMPACT  160.0f
-#define GOOD_IMPACT     340.0f
-#define UPHILL_SAFE_SLOPE 0.3f
-#define UPHILL_DAMAGE   60.0f
+#define PERFECT_IMPACT  130.0f
+#define GOOD_IMPACT     280.0f
+#define UPHILL_SAFE_SLOPE 0.4f
+#define UPHILL_DAMAGE   45.0f
 #define MAX_MARGIN      100.0f
 
 // seconds to wait before using the offline level
@@ -58,11 +55,9 @@
 #define MAX_COINS       6
 #define MAX_LEVELS      (MAX_COINS + 1)
 
-// limits for particles and floating text
 #define MAX_PARTICLES   96
 #define MAX_TEXTS       8
 
-// the four screens of the game
 typedef enum GameState {
     STATE_TITLE,
     STATE_LOADING,
@@ -78,7 +73,6 @@ typedef enum FetchStatus {
     FETCH_FAILED
 } FetchStatus;
 
-// everything about the player
 typedef struct Player {
     float x;
     float y;
@@ -91,13 +85,11 @@ typedef struct Player {
     float flash;
     float airTime;
     float cooldown;
-    float holdTime;
     int   score;
     bool  grounded;
     bool  holding;
 } Player;
 
-// one small dot for the trail and sparks
 typedef struct Particle {
     Vector2 pos;
     Vector2 vel;
@@ -107,7 +99,6 @@ typedef struct Particle {
     Color   color;
 } Particle;
 
-// text that floats up and fades
 typedef struct FloatText {
     Vector2 pos;
     float   life;
@@ -146,13 +137,11 @@ static bool        offlineMode = false;
 static char        sourceLabel[48] = "";
 static char        levelTitle[32] = "";
 
-// the terrain heights
 static float terrainY[MAX_SAMPLES];
 static int   sampleCount = 0;
 static float levelLength = 0.0f;
 static bool  bullMarket = true;
 
-// camera position and timers
 static float cameraX = 0.0f;
 static float cameraY = 0.0f;
 static float stateTimer = 0.0f;
@@ -166,13 +155,13 @@ static Sound sndWin;
 static Sound sndLose;
 static Music musicTrack;
 
-// player and effects
+static Camera2D camera2d;
+
 static Player    player;
 static bool      runWon = false;
 static Particle  particles[MAX_PARTICLES];
 static FloatText texts[MAX_TEXTS];
 
-// simple random numbers that give the same result each time
 static unsigned int rngState = 12345;
 static float RandFloat(void)
 {
@@ -183,7 +172,7 @@ static float RandFloat(void)
 // temporary map data for if i cant get the real money trends later on or if the api fails
 static void GenerateOfflineLevels(void)
 {
-    Level *lv = &levels[MAX_COINS];
+   Level *lv = &levels[MAX_COINS];
     rngState = 12345;
     float p = 60000.0f;
     float drift = 0.0f;
@@ -285,17 +274,6 @@ EM_JS(void, JsFetchMarket, (void), {
 });
 #endif
 
-// starts the web request
-static void StartFetch(void)
-{
-    fetchStatus = FETCH_PENDING;
-#if defined(PLATFORM_WEB)
-    JsFetchMarket();
-#else
-    fetchStatus = FETCH_FAILED;
-#endif
-}
-
 // picks a random coin that is not the last one played or the offline level if nothing loaded
 static void PickLevel(void)
 {
@@ -312,13 +290,11 @@ static void PickLevel(void)
     int pick = candidates[GetRandomValue(0, n - 1)];
     Level *lv = &levels[pick];
     lastLevel = pick;
-
     pointCount = lv->count;
     memcpy(prices, lv->prices, sizeof(float)*lv->count);
     memcpy(volumes, lv->volumes, sizeof(float)*lv->count);
     memcpy(priceTimes, lv->times, sizeof(double)*lv->count);
     offlineMode = (lv->source == 2);
-
     if (lv->source == 1)
     {
         snprintf(levelTitle, sizeof(levelTitle), "%s/USDT", lv->name);
@@ -400,7 +376,6 @@ static void BuildTerrain(void)
     bullMarket = (prices[pointCount - 1] >= prices[0]);
 }
 
-// gets a terrain point and stays inside the level
 static float TerrainAtIndex(int i)
 {
     if (i < 0) i = 0;
@@ -408,7 +383,6 @@ static float TerrainAtIndex(int i)
     return terrainY[i];
 }
 
-// height of the ground at any x position
 static float TerrainHeightAt(float worldX)
 {
     float f = worldX/SAMPLE_DX;
@@ -417,13 +391,12 @@ static float TerrainHeightAt(float worldX)
     return TerrainAtIndex(i) + (TerrainAtIndex(i + 1) - TerrainAtIndex(i))*t;
 }
 
-// how steep the ground is at x
 static float TerrainSlopeAt(float worldX)
 {
-    return (TerrainHeightAt(worldX + 24.0f) - TerrainHeightAt(worldX - 24.0f))/48.0f;
+    float w = 2.0f*SAMPLE_DX;
+    return (TerrainHeightAt(worldX + w) - TerrainHeightAt(worldX - w))/(2.0f*w);
 }
 
-// adds a particle in the first free slot
 static void EmitParticle(Vector2 pos, Vector2 vel, float life, float size, Color color)
 {
     for (int i = 0; i < MAX_PARTICLES; i++)
@@ -436,8 +409,7 @@ static void EmitParticle(Vector2 pos, Vector2 vel, float life, float size, Color
     }
 }
 
-// loads every sound and starts the music loop
-// in the web build these files come from the preloaded sounds folder inside index.data
+// in the web build these files come from the preloaded sounds folder inside the data file
 static void LoadGameAudio(void)
 {
     if (audioReady) return;
@@ -457,21 +429,6 @@ static void LoadGameAudio(void)
     audioReady = true;
 }
 
-// plays a sound only if the audio has been started
-static void PlayFx(Sound snd)
-{
-    if (audioReady) PlaySound(snd);
-}
-
-// the air sound gets a slightly different pitch each time so it is less repetitive
-static void PlayAirSound(void)
-{
-    if (!audioReady) return;
-    SetSoundPitch(sndAir, 0.92f + (float)GetRandomValue(0, 20)/100.0f);
-    PlaySound(sndAir);
-}
-
-// adds floating text in the first free slot
 static void SpawnText(Vector2 pos, const char *text, Color color)
 {
     for (int i = 0; i < MAX_TEXTS; i++)
@@ -488,7 +445,6 @@ static void SpawnText(Vector2 pos, const char *text, Color color)
     }
 }
 
-// moves and ages the particles and text
 static void UpdateEffects(float dt)
 {
     for (int i = 0; i < MAX_PARTICLES; i++)
@@ -510,7 +466,6 @@ static void UpdateEffects(float dt)
     }
 }
 
-// draws particles and text with the camera offset
 static void DrawEffects(void)
 {
     for (int i = 0; i < MAX_PARTICLES; i++)
@@ -519,72 +474,54 @@ static void DrawEffects(void)
         float k = particles[i].life/particles[i].maxLife;
         Color c = particles[i].color;
         c.a = (unsigned char)(255.0f*k);
-        DrawCircleV((Vector2){ particles[i].pos.x - cameraX + PLAYER_SCREEN_X, particles[i].pos.y - cameraY },
-                    particles[i].size*(0.4f + 0.6f*k), c);
+        DrawCircleV(particles[i].pos, particles[i].size*(0.4f + 0.6f*k), c);
     }
     for (int i = 0; i < MAX_TEXTS; i++)
     {
         if (texts[i].life <= 0.0f) continue;
         Color c = texts[i].color;
         c.a = (unsigned char)(255.0f*fminf(1.0f, texts[i].life*1.5f));
-        int w = MeasureText(texts[i].text, 26);
-        DrawText(texts[i].text, (int)(texts[i].pos.x - cameraX + PLAYER_SCREEN_X) - w/2,
-                 (int)(texts[i].pos.y - cameraY), 26, c);
+        int w = MeasureText(texts[i].text, 30);
+        DrawText(texts[i].text, (int)texts[i].pos.x - w/2, (int)texts[i].pos.y, 30, c);
     }
 }
 
-// draws text in the middle of the screen
 static void DrawCentered(const char *text, int y, int size, Color col)
 {
     DrawText(text, (SCREEN_W - MeasureText(text, size))/2, y, size, col);
 }
 
-// sky is green for a rising market and red for a falling one
-static void DrawSky(void)
-{
-    Color top = bullMarket ? (Color){ 20, 60, 50, 255 }  : (Color){ 70, 25, 35, 255 };
-    Color bot = bullMarket ? (Color){ 60, 150, 110, 255 } : (Color){ 160, 70, 60, 255 };
-    DrawRectangleGradientV(0, 0, SCREEN_W, SCREEN_H, top, bot);
-}
-
-// draws only the part of the ground that is on screen
 static void DrawTerrain(void)
 {
-    int first = (int)floorf((cameraX - PLAYER_SCREEN_X)/SAMPLE_DX) - 1;
-    int last  = first + (int)(SCREEN_W/SAMPLE_DX) + 3;
+    int first = (int)floorf((cameraX - PLAYER_SCREEN_X/CAMERA_ZOOM)/SAMPLE_DX) - 1;
+    int last  = first + (int)(SCREEN_W/CAMERA_ZOOM/SAMPLE_DX) + 3;
+    float bottom = camera2d.target.y + SCREEN_H/CAMERA_ZOOM;
 
     for (int i = first; i < last; i++)
     {
-        float x0 = (float)i*SAMPLE_DX - cameraX + PLAYER_SCREEN_X;
+        float x0 = (float)i*SAMPLE_DX;
         float x1 = x0 + SAMPLE_DX;
-        float y0 = TerrainAtIndex(i) - cameraY;
-        float y1 = TerrainAtIndex(i + 1) - cameraY;
-
-        // dark ground under the line
+        float y0 = TerrainAtIndex(i);
+        float y1 = TerrainAtIndex(i + 1);
         Color fill = (Color){ 18, 24, 38, 255 };
-        DrawTriangle((Vector2){ x0, y0 }, (Vector2){ x0, SCREEN_H }, (Vector2){ x1, SCREEN_H }, fill);
-        DrawTriangle((Vector2){ x0, y0 }, (Vector2){ x1, SCREEN_H }, (Vector2){ x1, y1 }, fill);
-
-        // green line going up and red going down
+        DrawTriangle((Vector2){ x0, y0 }, (Vector2){ x0, bottom }, (Vector2){ x1, bottom }, fill);
+        DrawTriangle((Vector2){ x0, y0 }, (Vector2){ x1, bottom }, (Vector2){ x1, y1 }, fill);
         Color line = (y1 <= y0) ? (Color){ 60, 230, 120, 255 } : (Color){ 240, 70, 70, 255 };
-        DrawLineEx((Vector2){ x0, y0 }, (Vector2){ x1, y1 }, 4.0f, line);
+        DrawLineEx((Vector2){ x0, y0 }, (Vector2){ x1, y1 }, 5.0f, line);
     }
 }
 
-// switches screen and resets the timer
 static void ChangeState(GameState next)
 {
     state = next;
     stateTimer = 0.0f;
 }
 
-// resets the player and camera for a new run
 static void StartRun(void)
 {
     float slope = TerrainSlopeAt(0.0f);
     memset(particles, 0, sizeof(particles));
     memset(texts, 0, sizeof(texts));
-
     player.x = 0.0f;
     player.y = TerrainHeightAt(0.0f);
     player.speed = CRUISE_SPEED;
@@ -596,7 +533,6 @@ static void StartRun(void)
     player.flash = 0.0f;
     player.airTime = 0.0f;
     player.cooldown = 0.0f;
-    player.holdTime = 0.0f;
     player.score = 0;
     player.grounded = true;
     player.holding = false;
@@ -607,42 +543,42 @@ static void StartRun(void)
     ChangeState(STATE_PLAYING);
 }
 
-// works out what happens when the player hits the ground
 static void LandPlayer(float groundY, float slope)
 {
-    // split the speed into along the ground and into the ground
     float len = sqrtf(1.0f + slope*slope);
     float tangent = (player.vx + player.vy*slope)/len;
     float impact = (player.vy - player.vx*slope)/len;
     if (impact < 0.0f) impact = 0.0f;
 
     Vector2 where = { player.x, groundY - 30.0f };
-
-    // short hops do not count
     if (player.airTime >= MIN_AIR_TIME)
     {
-        // only an uphill landing hurts and flats and small slopes are safe
-        // slope is negative when the ground goes up
         float uphill = -slope;
-        if (uphill > UPHILL_SAFE_SLOPE)
+
+        bool rising = player.vy < 0.0f;
+
+        if (!rising)
         {
-            player.margin -= (uphill - UPHILL_SAFE_SLOPE)*UPHILL_DAMAGE*(player.vx/CRUISE_SPEED);
-            player.flash = 0.4f;
-            tangent *= 0.7f;
-            SpawnText(where, "OUCH!", (Color){ 240, 70, 70, 255 });
-            PlayFx(sndDamage);
-        }
-        else if (impact < PERFECT_IMPACT)
-        {
-            player.score += 25;
-            tangent *= 1.08f;
-            SpawnText(where, "PERFECT!", YELLOW);
-            PlayFx(sndPerfect);
-        }
-        else if (impact < GOOD_IMPACT)
-        {
-            player.score += 10;
-            SpawnText(where, "+10", RAYWHITE);
+            if (uphill > UPHILL_SAFE_SLOPE)
+            {
+                player.margin -= (uphill - UPHILL_SAFE_SLOPE)*UPHILL_DAMAGE*(player.vx/CRUISE_SPEED);
+                player.flash = 0.4f;
+                tangent *= 0.7f;
+                SpawnText(where, "OUCH!", (Color){ 240, 70, 70, 255 });
+                if (audioReady) PlaySound(sndDamage);
+            }
+            else if (impact < PERFECT_IMPACT)
+            {
+                player.score += 25;
+                tangent *= 1.08f;
+                SpawnText(where, "PERFECT!", YELLOW);
+                if (audioReady) PlaySound(sndPerfect);
+            }
+            else if (impact < GOOD_IMPACT)
+            {
+                player.score += 10;
+                SpawnText(where, "+10", RAYWHITE);
+            }
         }
 
         for (int i = 0; i < 10; i++)
@@ -651,7 +587,6 @@ static void LandPlayer(float groundY, float slope)
                          0.5f, 4.0f, (Color){ 220, 230, 255, 255 });
     }
 
-    // keep the speed after landing
     player.speed = fminf(fmaxf(tangent, MIN_SPEED), MAX_SPEED);
     player.y = groundY;
     player.vy = 0.0f;
@@ -660,64 +595,43 @@ static void LandPlayer(float groundY, float slope)
     player.grounded = true;
 }
 
-// all the player movement and input
 static void UpdatePlayer(float dt)
 {
     if (dt < 0.001f) dt = 0.001f;
 
-    // check if the button is being held
-    bool wasHolding = player.holding;
-    float heldFor = player.holdTime;
     player.holding = IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S) || IsMouseButtonDown(MOUSE_BUTTON_LEFT);
-    bool released = wasHolding && !player.holding;
-    player.holdTime = player.holding ? player.holdTime + dt : 0.0f;
 
     if (player.flash > 0.0f) player.flash -= dt;
 
     float slope;
     float targetAngle;
 
-    // on the ground the player follows the slope
     if (player.grounded)
     {
         slope = TerrainSlopeAt(player.x);
         float len = sqrtf(1.0f + slope*slope);
         float sinT = slope/len;
-
-        // downhill speeds up and uphill slows down
         float accel = SLOPE_ACCEL*sinT*(player.holding ? HOLD_BOOST : 1.0f);
         if (sinT < 0.0f) accel *= UPHILL_FACTOR;
+        
         player.speed += accel*dt + (CRUISE_SPEED - player.speed)*CRUISE_PULL*dt;
         player.speed = fminf(fmaxf(player.speed, MIN_SPEED), MAX_SPEED);
-
         player.vx = player.speed/len;
-        // bend is how sharply the ground curves away
         float bend = (slope - player.prevSlope)*player.vx/dt;
         if (player.cooldown > 0.0f) player.cooldown -= dt;
 
-        // letting go on a downhill pops the player up
-        if (released && heldFor >= RELEASE_MIN_HOLD && slope > RELEASE_MIN_SLOPE)
-        {
-            float speedPct = fminf(1.0f, player.speed/MAX_SPEED);
-            player.grounded = false;
-            player.airTime = 0.0f;
-            player.vy = slope*player.vx - RELEASE_POP*(0.7f + 0.6f*speedPct);
-            SpawnText((Vector2){ player.x, player.y - 40.0f }, "POP!", (Color){ 255, 220, 120, 255 });
-            PlayAirSound();
-            for (int i = 0; i < 6; i++)
-                EmitParticle((Vector2){ player.x, player.y },
-                             (Vector2){ -player.vx*0.2f + (RandFloat() - 0.5f)*80.0f, -RandFloat()*140.0f },
-                             0.4f, 3.5f, (Color){ 255, 200, 80, 255 });
-        }
-        // flying off the top of a hill
-        else if (bend > LAUNCH_ACCEL && player.cooldown <= 0.0f)
+        if (bend > LAUNCH_ACCEL && player.cooldown <= 0.0f)
         {
             player.grounded = false;
             player.airTime = 0.0f;
             player.vy = player.prevSlope*player.vx;
             if (!player.holding) player.vy -= CREST_POP*(player.vx/CRUISE_SPEED);
             SpawnText((Vector2){ player.x, player.y - 40.0f }, "AIR!", (Color){ 180, 220, 255, 255 });
-            PlayAirSound();
+            if (audioReady)
+            {
+                SetSoundPitch(sndAir, 0.92f + (float)GetRandomValue(0, 20)/100.0f);
+                PlaySound(sndAir);
+            }
         }
         else
         {
@@ -728,51 +642,45 @@ static void UpdatePlayer(float dt)
             player.angle += (targetAngle - player.angle)*fminf(1.0f, 14.0f*dt);
 
             if (player.holding)
-                EmitParticle((Vector2){ player.x - 18.0f, player.y },
+                EmitParticle((Vector2){ player.x - 12.0f, player.y },
                              (Vector2){ -player.speed*0.15f, -RandFloat()*60.0f },
                              0.35f, 3.0f + player.speed/300.0f, (Color){ 255, 200, 80, 255 });
         }
     }
 
-    // in the air gravity pulls the player down
     if (!player.grounded)
     {
-        // holding in the air dives faster
         float g = player.holding ? GRAVITY*AIR_DIVE_MULT : GRAVITY;
         player.vy += g*dt;
         player.x += player.vx*dt;
         player.y += player.vy*dt;
         player.airTime += dt;
-
         targetAngle = atan2f(player.vy, player.vx)*RAD2DEG;
         player.angle += (targetAngle - player.angle)*fminf(1.0f, 10.0f*dt);
-
         float groundY = TerrainHeightAt(player.x);
         if (player.y >= groundY)
             LandPlayer(groundY, TerrainSlopeAt(player.x));
         else
-            EmitParticle((Vector2){ player.x - 12.0f, player.y },
-                         (Vector2){ -player.vx*0.1f, 0.0f }, 0.25f, 2.5f, (Color){ 255, 255, 255, 200 });
+            EmitParticle((Vector2){ player.x - 8.0f, player.y },
+                         (Vector2){ -player.vx*0.1f, 0.0f }, 0.25f, 2.0f, (Color){ 255, 255, 255, 200 });
     }
 
-    // camera follows the player
     cameraX = player.x;
 }
 
-// draws the board and the rider
 static void DrawPlayer(void)
 {
     float a = player.angle*DEG2RAD;
-    Vector2 pos = { PLAYER_SCREEN_X, player.y - cameraY };
-    Vector2 rider = { pos.x + sinf(a)*13.0f, pos.y - cosf(a)*13.0f };
+    float s = PLAYER_SCALE;
+    Vector2 pos = { player.x, player.y };
+    Vector2 rider = { pos.x + sinf(a)*13.0f*s, pos.y - cosf(a)*13.0f*s };
 
-    Rectangle board = { pos.x, pos.y - 2.0f, 44.0f, 6.0f };
-    DrawRectanglePro(board, (Vector2){ 22.0f, 3.0f }, player.angle, player.holding ? (Color){ 255, 200, 80, 255 } : RAYWHITE);
-    DrawCircleV(rider, 9.0f, ORANGE);
-    DrawCircleV((Vector2){ rider.x + 3.0f, rider.y - 2.0f }, 2.5f, BLACK);
+    Rectangle board = { pos.x, pos.y - 2.0f*s, 44.0f*s, 6.0f*s };
+    DrawRectanglePro(board, (Vector2){ 22.0f*s, 3.0f*s }, player.angle, player.holding ? (Color){ 255, 200, 80, 255 } : RAYWHITE);
+    DrawCircleV(rider, 9.0f*s, ORANGE);
+    DrawCircleV((Vector2){ rider.x + 3.0f*s, rider.y - 2.0f*s }, 2.5f*s, BLACK);
 }
 
-// pick a level then build it then start
 static void NewRun(void)
 {
     PickLevel();
@@ -780,17 +688,14 @@ static void NewRun(void)
     StartRun();
 }
 
-// runs every frame
 static void UpdateDrawFrame(void)
 {
     float dt = GetFrameTime();
     if (dt > 0.05f) dt = 0.05f;
     stateTimer += dt;
 
-    // the music stream needs a refill every frame
     if (audioReady) UpdateMusicStream(musicTrack);
 
-    // camera height follows the player smoothly
     float followY = (state == STATE_PLAYING) ? player.y : TerrainHeightAt(cameraX);
     float camBlend = 5.0f*dt;
     if (camBlend > 1.0f) camBlend = 1.0f;
@@ -798,7 +703,6 @@ static void UpdateDrawFrame(void)
 
     UpdateEffects(dt);
 
-    // update logic for each screen
     switch (state)
     {
         case STATE_TITLE:
@@ -816,7 +720,16 @@ static void UpdateDrawFrame(void)
             // the game keeps drawing while the request runs and goes offline if it fails or takes too long
             if (!dataLoaded)
             {
-                if (fetchStatus == FETCH_IDLE) StartFetch();
+                // the request starts once and the desktop build has no browser so it goes straight to offline
+                if (fetchStatus == FETCH_IDLE)
+                {
+                    fetchStatus = FETCH_PENDING;
+#if defined(PLATFORM_WEB)
+                    JsFetchMarket();
+#else
+                    fetchStatus = FETCH_FAILED;
+#endif
+                }
                 if (fetchStatus == FETCH_OK) dataLoaded = true;
                 else if (fetchStatus == FETCH_FAILED || stateTimer > FETCH_GIVE_UP)
                 {
@@ -832,16 +745,22 @@ static void UpdateDrawFrame(void)
             if (player.margin <= 0.0f)
             {
                 runWon = false;
-                PlayFx(sndLose);
-                if (audioReady) PauseMusicStream(musicTrack);
+                if (audioReady)
+                {
+                    PlaySound(sndLose);
+                    PauseMusicStream(musicTrack);
+                }
                 ChangeState(STATE_GAMEOVER);
             }
             else if (player.x >= levelLength)
             {
                 cameraX = levelLength;
                 runWon = true;
-                PlayFx(sndWin);
-                if (audioReady) PauseMusicStream(musicTrack);
+                if (audioReady)
+                {
+                    PlaySound(sndWin);
+                    PauseMusicStream(musicTrack);
+                }
                 ChangeState(STATE_GAMEOVER);
             }
             break;
@@ -852,13 +771,23 @@ static void UpdateDrawFrame(void)
             break;
     }
 
-    // drawing starts here
     BeginDrawing();
         ClearBackground(BLACK);
-        DrawSky();
-        DrawTerrain();
 
-        // text and hud for each screen
+        Color skyTop = bullMarket ? (Color){ 20, 60, 50, 255 }  : (Color){ 70, 25, 35, 255 };
+        Color skyBottom = bullMarket ? (Color){ 60, 150, 110, 255 } : (Color){ 160, 70, 60, 255 };
+        DrawRectangleGradientV(0, 0, SCREEN_W, SCREEN_H, skyTop, skyBottom);
+
+        camera2d.target = (Vector2){ cameraX, cameraY + CAMERA_Y };
+        BeginMode2D(camera2d);
+            DrawTerrain();
+            if (state == STATE_PLAYING)
+            {
+                DrawEffects();
+                DrawPlayer();
+            }
+        EndMode2D();
+
         switch (state)
         {
             case STATE_TITLE:
@@ -880,12 +809,9 @@ static void UpdateDrawFrame(void)
 
             case STATE_PLAYING:
             {
-                DrawEffects();
-                DrawPlayer();
                 if (player.flash > 0.0f)
                     DrawRectangle(0, 0, SCREEN_W, SCREEN_H, (Color){ 255, 0, 0, (unsigned char)(player.flash/0.4f*110.0f) });
 
-                // margin bar
                 float marginPct = player.margin/MAX_MARGIN;
                 if (marginPct < 0.0f) marginPct = 0.0f;
                 Color barCol = (marginPct > 0.5f) ? (Color){ 60, 230, 120, 255 } : (marginPct > 0.25f) ? ORANGE : (Color){ 240, 70, 70, 255 };
@@ -893,19 +819,15 @@ static void UpdateDrawFrame(void)
                 DrawRectangle(SCREEN_W - 190, 20, 170, 16, (Color){ 0, 0, 0, 140 });
                 DrawRectangle(SCREEN_W - 190, 20, (int)(170.0f*marginPct), 16, barCol);
                 DrawRectangleLines(SCREEN_W - 190, 20, 170, 16, RAYWHITE);
-
-                // speed bar
                 float spd = (player.grounded ? player.speed : player.vx);
                 float spdPct = fminf(1.0f, spd/MAX_SPEED);
                 DrawText("SPEED", SCREEN_W - 260, 44, 18, RAYWHITE);
                 DrawRectangle(SCREEN_W - 190, 46, 170, 16, (Color){ 0, 0, 0, 140 });
                 DrawRectangle(SCREEN_W - 190, 46, (int)(170.0f*spdPct), 16, (Color){ 255, 200, 80, 255 });
                 DrawRectangleLines(SCREEN_W - 190, 46, 170, 16, RAYWHITE);
-
                 DrawText(TextFormat("Score: %d", player.score), SCREEN_W - 260, 72, 22, YELLOW);
                 DrawText("HOLD SPACE / CLICK / DOWN: press into the slope (downhill = speed, uphill = slow)", 20, SCREEN_H - 28, 18, RAYWHITE);
 
-                // work out the price where the player is
                 float f = player.x/(SAMPLE_DX*SUBDIV);
                 int a = (int)f;
                 if (a < 0) a = 0;
@@ -920,7 +842,6 @@ static void UpdateDrawFrame(void)
                 DrawText(sourceLabel, 20, 108, 18, LIGHTGRAY);
                 if (offlineMode) DrawText("OFFLINE MODE", 20, 130, 22, (Color){ 255, 140, 60, 255 });
 
-                // show the level name at the start
                 if (stateTimer < 2.5f)
                 {
                     float fade = fminf(1.0f, (2.5f - stateTimer)*2.0f);
@@ -947,7 +868,9 @@ int main(void)
 {
     InitWindow(SCREEN_W, SCREEN_H, "Market Surfer");
     SetExitKey(KEY_NULL);
-
+    camera2d.offset = (Vector2){ PLAYER_SCREEN_X, CAMERA_Y };
+    camera2d.rotation = 0.0f;
+    camera2d.zoom = CAMERA_ZOOM;
     // random seed so the coin is different each time
     SetRandomSeed((unsigned int)time(NULL));
     // make the offline level first so the title has a map
@@ -955,7 +878,6 @@ int main(void)
     PickLevel();
     BuildTerrain();
 
-// help from AI understanding emscripten
 #if defined(PLATFORM_WEB)
     // the browser runs the loop so it is given the frame function and that cannot block
     emscripten_set_main_loop(UpdateDrawFrame, 0, 1);
