@@ -2,9 +2,9 @@
 
 
 
-Play it online: [[Market Surfer on Itch.io](https://bradleycurtis.itch.io/market-surfer)]
+Play it online: [Market Surfer on Itch.io](https://bradleycurtis.itch.io/market-surfer)
 
-![Gameplay](demo.gif)
+![Gameplay](https://raw.githubusercontent.com/BradleyCurtisDev/Raylib-Web-Game-2309516/refs/heads/main/MarketSurfer.gif)
 
 ## Controls
 
@@ -52,4 +52,4 @@ If the API request fails, the game uses an offline backup map so it can still be
 - Price data: Binance public API
 - Sounds: All sounds were gathered from [Freesounds.org](https://freesound.org/)
 
-AI use: I used Claude Sonnet 5.5 To help with some of the work in the project such as: Bug fixing, Understanding tools like emscripten and help with compiling the main.c file for WebAssembly.
+AI use: I used Claude Sonnet 5.5 To help with some of the work in the project such as: Bug fixing, Understanding tools like emscripten and help with compiling the main.c file for WebAssembly. https://claude.com/
